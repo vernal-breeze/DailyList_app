@@ -1,6 +1,6 @@
 # List Finished
 
-一个基于 React + TypeScript + FastAPI 的日程清单应用，支持 Web 端运行。
+一个基于 React + TypeScript + FastAPI 的无广告安卓日程清单应用，支持 Web 端运行。
 
 ## 功能
 
