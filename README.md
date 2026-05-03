@@ -4,9 +4,17 @@
 
 ## 功能
 
+- 首页
+![head](img/head_page.jpg)
+
 - 任务创建 / 编辑 / 删除 / 完成切换
+![set_task](img/set_task.jpg)
 - 每日 / 每周 / 每月重复任务
+![MonthView](img/MonthView.jpg)
+
 - 日视图 / 周视图 / 月视图 / 日程列表
+![MonthView](img/DayView.jpg)
+![TaskList](img/TaskList.jpg)
 - 离线操作 + 异步同步到后端
 - 撤销 / 重做（Ctrl+Z）
 - 快速添加（Ctrl+N）
