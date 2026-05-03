@@ -1,0 +1,9 @@
+# 排除的目录
+optimized-schedule-app/
+
+# 其他排除项
+node_modules/
+dist/
+.build/
+.env
+*.log

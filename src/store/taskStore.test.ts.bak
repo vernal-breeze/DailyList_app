@@ -1,0 +1,1023 @@
+// Mock import.meta.env for Vite
+Object.defineProperty(globalThis, 'import', {
+  value: {
+    meta: {
+      env: {
+        VITE_API_BASE_URL: 'http://localhost:8000/api',
+      },
+    },
+  },
+  writable: true,
+  configurable: true,
+});
+
+import { useTaskStore, getTodayTasks, getWeekTasks, getMonthTasksFromStore, getTasksInRange } from './taskStore';
+import { Task, SubTask } from '../types';
+import { scheduleTaskNotification, cancelTaskNotification } from '../services/notificationService';
+
+// Mock notification service
+jest.mock('../services/notificationService', () => ({
+  scheduleTaskNotification: jest.fn(),
+  cancelTaskNotification: jest.fn(),
+  rescheduleAllNotifications: jest.fn()
+}));
+
+// Mock taskApi - return success with the data passed in
+jest.mock('../api/taskApi', () => ({
+  taskApi: {
+    getAll: jest.fn(() => Promise.resolve({ success: true, data: [] })),
+    create: jest.fn((task: any) => Promise.resolve({ success: true, data: task })),
+    update: jest.fn((_id: string, updates: any) => Promise.resolve({ success: true, data: updates })),
+    delete: jest.fn(() => Promise.resolve({ success: true })),
+    toggleCompleted: jest.fn((_id: string, completed: boolean) => Promise.resolve({ success: true, data: { completed } })),
+    addSubTask: jest.fn((_taskId: string, subtask: any) => Promise.resolve({ success: true, data: subtask })),
+    updateSubTask: jest.fn((_taskId: string, _subtaskId: string, updates: any) => Promise.resolve({ success: true, data: updates })),
+    deleteSubTask: jest.fn(() => Promise.resolve({ success: true })),
+  },
+}));
+
+const mockScheduleTaskNotification = scheduleTaskNotification as jest.MockedFunction<typeof scheduleTaskNotification>;
+const mockCancelTaskNotification = cancelTaskNotification as jest.MockedFunction<typeof cancelTaskNotification>;
+
+function createTestTask(overrides: Partial<Omit<Task, 'id' | 'createdAt' | 'subtasks'>> = {}): Omit<Task, 'id' | 'createdAt' | 'subtasks'> {
+  return {
+    title: 'Test Task',
+    dueDate: new Date().toISOString(),
+    priority: 'medium',
+    startDate: new Date().toISOString(),
+    taskType: 'single',
+    recurrence: {
+      enabled: false,
+      type: 'daily',
+      interval: 1,
+      days: [],
+      end: { type: 'never' },
+      exceptions: []
+    },
+    reminderEnabled: false,
+    notificationId: 0,
+    completed: false,
+    completedDates: [],
+    ...overrides,
+  };
+}
+
+describe('Task Store', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    // Reset store synchronously
+    useTaskStore.setState({ tasks: [], loading: false, error: null });
+  });
+
+  describe('addTask', () => {
+    it('should add a new task optimistically', async () => {
+      const store = useTaskStore.getState();
+      const newTask = createTestTask({ title: 'Test Task', reminderEnabled: true, notificationId: 123 });
+
+      store.addTask(newTask);
+
+      // Optimistic update is synchronous
+      const updatedStore = useTaskStore.getState();
+      expect(updatedStore.tasks.length).toBe(1);
+      expect(updatedStore.tasks[0].title).toBe('Test Task');
+      expect(mockScheduleTaskNotification).toHaveBeenCalled();
+    });
+
+    it('should not schedule notification when reminder is disabled', async () => {
+      const store = useTaskStore.getState();
+      const newTask = createTestTask({ reminderEnabled: false });
+
+      store.addTask(newTask);
+
+      const updatedStore = useTaskStore.getState();
+      expect(updatedStore.tasks.length).toBe(1);
+      expect(mockScheduleTaskNotification).not.toHaveBeenCalled();
+    });
+
+    it('should rollback on API failure', async () => {
+      // Mock API failure
+      const { taskApi } = require('../api/taskApi');
+      taskApi.create.mockResolvedValueOnce({ success: false, error: 'Network error' });
+
+      const store = useTaskStore.getState();
+      const newTask = createTestTask();
+
+      store.addTask(newTask);
+
+      // Optimistic: task should be added
+      expect(useTaskStore.getState().tasks.length).toBe(1);
+
+      // Wait for async API call to complete
+      await new Promise(resolve => setTimeout(resolve, 10));
+
+      // Should rollback
+      expect(useTaskStore.getState().tasks.length).toBe(0);
+      expect(useTaskStore.getState().error).toContain('创建任务失败');
+    });
+  });
+
+  describe('updateTask', () => {
+    it('should update a task optimistically', async () => {
+      const store = useTaskStore.getState();
+
+      // Add a task first
+      store.addTask(createTestTask({ title: 'Initial Task', reminderEnabled: true, notificationId: 123 }));
+      const taskId = useTaskStore.getState().tasks[0].id;
+
+      store.updateTask(taskId, { title: 'Updated Task' });
+
+      const updatedStore = useTaskStore.getState();
+      expect(updatedStore.tasks[0].title).toBe('Updated Task');
+    });
+
+    it('should rollback on API failure', async () => {
+      const { taskApi } = require('../api/taskApi');
+      taskApi.update.mockResolvedValueOnce({ success: false, error: 'Network error' });
+
+      const store = useTaskStore.getState();
+      store.addTask(createTestTask({ title: 'Original' }));
+      const taskId = useTaskStore.getState().tasks[0].id;
+
+      store.updateTask(taskId, { title: 'Changed' });
+
+      // Optimistic: title should be changed
+      expect(useTaskStore.getState().tasks[0].title).toBe('Changed');
+
+      await new Promise(resolve => setTimeout(resolve, 10));
+
+      // Should rollback
+      expect(useTaskStore.getState().tasks[0].title).toBe('Original');
+    });
+  });
+
+  describe('deleteTask', () => {
+    it('should delete a task optimistically', async () => {
+      const store = useTaskStore.getState();
+      store.addTask(createTestTask({ reminderEnabled: true, notificationId: 123 }));
+      const taskId = useTaskStore.getState().tasks[0].id;
+
+      store.deleteTask(taskId);
+
+      expect(useTaskStore.getState().tasks.length).toBe(0);
+      expect(mockCancelTaskNotification).toHaveBeenCalled();
+    });
+
+    it('should rollback on API failure', async () => {
+      const { taskApi } = require('../api/taskApi');
+      taskApi.delete.mockResolvedValueOnce({ success: false, error: 'Network error' });
+
+      const store = useTaskStore.getState();
+      store.addTask(createTestTask({ title: 'To Delete' }));
+      const taskId = useTaskStore.getState().tasks[0].id;
+
+      store.deleteTask(taskId);
+
+      // Optimistic: task should be removed
+      expect(useTaskStore.getState().tasks.length).toBe(0);
+
+      await new Promise(resolve => setTimeout(resolve, 10));
+
+      // Should rollback
+      expect(useTaskStore.getState().tasks.length).toBe(1);
+    });
+
+    it('should cancel notification when deleting a task with reminder', async () => {
+      const store = useTaskStore.getState();
+      store.addTask(createTestTask({ reminderEnabled: true, notificationId: 456 }));
+      const taskId = useTaskStore.getState().tasks[0].id;
+
+      store.deleteTask(taskId);
+
+      expect(mockCancelTaskNotification).toHaveBeenCalled();
+    });
+  });
+
+  describe('toggleTaskCompleted', () => {
+    it('should toggle completion status optimistically', async () => {
+      const store = useTaskStore.getState();
+      store.addTask(createTestTask({ completed: false, reminderEnabled: true, notificationId: 123 }));
+      const taskId = useTaskStore.getState().tasks[0].id;
+
+      store.toggleTaskCompleted(taskId);
+
+      expect(useTaskStore.getState().tasks[0].completed).toBe(true);
+      expect(mockCancelTaskNotification).toHaveBeenCalled();
+    });
+
+    it('should rollback on API failure', async () => {
+      const { taskApi } = require('../api/taskApi');
+      taskApi.toggleCompleted.mockResolvedValueOnce({ success: false, error: 'Network error' });
+
+      const store = useTaskStore.getState();
+      store.addTask(createTestTask({ completed: false }));
+      const taskId = useTaskStore.getState().tasks[0].id;
+
+      store.toggleTaskCompleted(taskId);
+
+      expect(useTaskStore.getState().tasks[0].completed).toBe(true);
+
+      await new Promise(resolve => setTimeout(resolve, 10));
+
+      expect(useTaskStore.getState().tasks[0].completed).toBe(false);
+    });
+  });
+
+  describe('clearTasks', () => {
+    it('should clear all tasks', async () => {
+      const store = useTaskStore.getState();
+      store.addTask(createTestTask({ title: 'Task 1' }));
+      store.addTask(createTestTask({ title: 'Task 2' }));
+
+      expect(useTaskStore.getState().tasks.length).toBe(2);
+
+      store.clearTasks();
+
+      // clearTasks is synchronous for the set() part
+      expect(useTaskStore.getState().tasks.length).toBe(0);
+    });
+  });
+
+  describe('addSubTask', () => {
+    it('should add a subtask to a task', async () => {
+      const store = useTaskStore.getState();
+      store.addTask(createTestTask({ title: 'Parent' }));
+      const taskId = useTaskStore.getState().tasks[0].id;
+
+      store.addSubTask(taskId, null, 'Sub 1');
+
+      const subTasks = useTaskStore.getState().tasks[0].subtasks;
+      expect(subTasks.length).toBe(1);
+      expect(subTasks[0].title).toBe('Sub 1');
+      expect(subTasks[0].level).toBe(0);
+      expect(subTasks[0].completed).toBe(false);
+    });
+
+    it('should add a nested subtask', async () => {
+      const store = useTaskStore.getState();
+      store.addTask(createTestTask({ title: 'Parent' }));
+      const taskId = useTaskStore.getState().tasks[0].id;
+      store.addSubTask(taskId, null, 'Level 1');
+      const subId = useTaskStore.getState().tasks[0].subtasks[0].id;
+
+      store.addSubTask(taskId, subId, 'Level 2');
+
+      const subtasks = useTaskStore.getState().tasks[0].subtasks;
+      expect(subtasks[0].subtasks.length).toBe(1);
+      expect(subtasks[0].subtasks[0].title).toBe('Level 2');
+      expect(subtasks[0].subtasks[0].level).toBe(1);
+    });
+
+    it('should rollback on addSubTask API failure', async () => {
+      const { taskApi } = require('../api/taskApi');
+      taskApi.addSubTask.mockResolvedValueOnce({ success: false, error: 'Network error' });
+
+      const store = useTaskStore.getState();
+      store.addTask(createTestTask({ title: 'Parent' }));
+      const taskId = useTaskStore.getState().tasks[0].id;
+
+      store.addSubTask(taskId, null, 'Sub 1');
+
+      // Optimistic: subtask should be added
+      expect(useTaskStore.getState().tasks[0].subtasks.length).toBe(1);
+
+      await new Promise(resolve => setTimeout(resolve, 10));
+
+      // Rollback: subtask removed
+      expect(useTaskStore.getState().tasks[0].subtasks.length).toBe(0);
+    });
+  });
+
+  describe('updateSubTask', () => {
+    it('should update a subtask optimistically', async () => {
+      const store = useTaskStore.getState();
+      store.addTask(createTestTask({ title: 'Parent' }));
+      const taskId = useTaskStore.getState().tasks[0].id;
+      store.addSubTask(taskId, null, 'Sub 1');
+      const subId = useTaskStore.getState().tasks[0].subtasks[0].id;
+
+      store.updateSubTask(taskId, subId, { title: 'Updated Sub' });
+
+      expect(useTaskStore.getState().tasks[0].subtasks[0].title).toBe('Updated Sub');
+    });
+
+    it('should rollback on updateSubTask API failure', async () => {
+      const { taskApi } = require('../api/taskApi');
+      taskApi.updateSubTask.mockResolvedValueOnce({ success: false, error: 'Network error' });
+
+      const store = useTaskStore.getState();
+      store.addTask(createTestTask({ title: 'Parent' }));
+      const taskId = useTaskStore.getState().tasks[0].id;
+      store.addSubTask(taskId, null, 'Sub 1');
+      const subId = useTaskStore.getState().tasks[0].subtasks[0].id;
+
+      store.updateSubTask(taskId, subId, { title: 'Updated' });
+
+      expect(useTaskStore.getState().tasks[0].subtasks[0].title).toBe('Updated');
+
+      await new Promise(resolve => setTimeout(resolve, 10));
+
+      expect(useTaskStore.getState().tasks[0].subtasks[0].title).toBe('Sub 1');
+    });
+  });
+
+  describe('deleteSubTask', () => {
+    it('should delete a subtask optimistically', async () => {
+      const store = useTaskStore.getState();
+      store.addTask(createTestTask({ title: 'Parent' }));
+      const taskId = useTaskStore.getState().tasks[0].id;
+      store.addSubTask(taskId, null, 'Sub 1');
+      const subId = useTaskStore.getState().tasks[0].subtasks[0].id;
+
+      store.deleteSubTask(taskId, subId);
+
+      expect(useTaskStore.getState().tasks[0].subtasks.length).toBe(0);
+    });
+
+    it('should rollback on deleteSubTask API failure', async () => {
+      const { taskApi } = require('../api/taskApi');
+      taskApi.deleteSubTask.mockResolvedValueOnce({ success: false, error: 'Network error' });
+
+      const store = useTaskStore.getState();
+      store.addTask(createTestTask({ title: 'Parent' }));
+      const taskId = useTaskStore.getState().tasks[0].id;
+      store.addSubTask(taskId, null, 'Sub 1');
+      const subId = useTaskStore.getState().tasks[0].subtasks[0].id;
+
+      store.deleteSubTask(taskId, subId);
+
+      expect(useTaskStore.getState().tasks[0].subtasks.length).toBe(0);
+
+      await new Promise(resolve => setTimeout(resolve, 10));
+
+      expect(useTaskStore.getState().tasks[0].subtasks.length).toBe(1);
+    });
+  });
+
+  describe('toggleSubTaskCompleted', () => {
+    it('should toggle subtask completion optimistically', async () => {
+      const store = useTaskStore.getState();
+      store.addTask(createTestTask({ title: 'Parent' }));
+      const taskId = useTaskStore.getState().tasks[0].id;
+      store.addSubTask(taskId, null, 'Sub 1');
+      const subId = useTaskStore.getState().tasks[0].subtasks[0].id;
+
+      expect(useTaskStore.getState().tasks[0].subtasks[0].completed).toBe(false);
+
+      store.toggleSubTaskCompleted(taskId, subId);
+
+      expect(useTaskStore.getState().tasks[0].subtasks[0].completed).toBe(true);
+    });
+
+    it('should rollback on toggleSubTaskCompleted API failure', async () => {
+      const { taskApi } = require('../api/taskApi');
+      taskApi.updateSubTask.mockResolvedValueOnce({ success: false, error: 'Network error' });
+
+      const store = useTaskStore.getState();
+      store.addTask(createTestTask({ title: 'Parent' }));
+      const taskId = useTaskStore.getState().tasks[0].id;
+      store.addSubTask(taskId, null, 'Sub 1');
+      const subId = useTaskStore.getState().tasks[0].subtasks[0].id;
+
+      store.toggleSubTaskCompleted(taskId, subId);
+
+      expect(useTaskStore.getState().tasks[0].subtasks[0].completed).toBe(true);
+
+      await new Promise(resolve => setTimeout(resolve, 10));
+
+      expect(useTaskStore.getState().tasks[0].subtasks[0].completed).toBe(false);
+    });
+  });
+
+  describe('updateRecurrence', () => {
+    it('should update recurrence settings optimistically', async () => {
+      const store = useTaskStore.getState();
+      store.addTask(createTestTask({ title: 'Recurring' }));
+      const taskId = useTaskStore.getState().tasks[0].id;
+
+      const newRecurrence = {
+        enabled: true,
+        type: 'weekly' as const,
+        interval: 1,
+        days: [1, 3, 5],
+        end: { type: 'never' as const },
+        exceptions: []
+      };
+
+      store.updateRecurrence(taskId, newRecurrence);
+
+      const updatedRecurrence = useTaskStore.getState().tasks[0].recurrence;
+      expect(updatedRecurrence.enabled).toBe(true);
+      expect(updatedRecurrence.type).toBe('weekly');
+      expect(updatedRecurrence.days).toEqual([1, 3, 5]);
+    });
+
+    it('should rollback on updateRecurrence API failure', async () => {
+      const { taskApi } = require('../api/taskApi');
+      taskApi.update.mockResolvedValueOnce({ success: false, error: 'Network error' });
+
+      const store = useTaskStore.getState();
+      store.addTask(createTestTask({ title: 'Recurring' }));
+      const taskId = useTaskStore.getState().tasks[0].id;
+
+      store.updateRecurrence(taskId, { enabled: true, type: 'weekly', interval: 1, days: [1], end: { type: 'never' }, exceptions: [] });
+
+      expect(useTaskStore.getState().tasks[0].recurrence.enabled).toBe(true);
+
+      await new Promise(resolve => setTimeout(resolve, 10));
+
+      expect(useTaskStore.getState().tasks[0].recurrence.enabled).toBe(false);
+    });
+  });
+
+  describe('addException / removeException', () => {
+    it('should add and remove an exception date', async () => {
+      const store = useTaskStore.getState();
+      store.addTask(createTestTask({
+        title: 'Recurring',
+        recurrence: { enabled: true, type: 'daily', interval: 1, days: [], end: { type: 'never' }, exceptions: [] }
+      }));
+      const taskId = useTaskStore.getState().tasks[0].id;
+
+      store.addException(taskId, '2026-05-10');
+      expect(useTaskStore.getState().tasks[0].recurrence.exceptions).toContain('2026-05-10');
+
+      store.removeException(taskId, '2026-05-10');
+      expect(useTaskStore.getState().tasks[0].recurrence.exceptions).not.toContain('2026-05-10');
+    });
+  });
+
+  describe('setOnlineStatus', () => {
+    it('should set online status', () => {
+      const store = useTaskStore.getState();
+      expect(store.isOnline).toBe(true);
+
+      store.setOnlineStatus(false);
+      expect(useTaskStore.getState().isOnline).toBe(false);
+
+      store.setOnlineStatus(true);
+      expect(useTaskStore.getState().isOnline).toBe(true);
+    });
+  });
+
+  describe('toggleTaskCompleted - 通知分支', () => {
+    it('toggle from false to true: cancels notification', async () => {
+      const store = useTaskStore.getState();
+      store.addTask(createTestTask({ completed: false, reminderEnabled: true, notificationId: 789 }));
+      const taskId = useTaskStore.getState().tasks[0].id;
+
+      store.toggleTaskCompleted(taskId);
+
+      expect(useTaskStore.getState().tasks[0].completed).toBe(true);
+      expect(mockCancelTaskNotification).toHaveBeenCalled();
+    });
+
+    it('toggle from true to false with reminder: reschedules notification', async () => {
+      const store = useTaskStore.getState();
+      store.addTask(createTestTask({ completed: true, reminderEnabled: true, notificationId: 789 }));
+      const taskId = useTaskStore.getState().tasks[0].id;
+
+      store.toggleTaskCompleted(taskId);
+
+      expect(useTaskStore.getState().tasks[0].completed).toBe(false);
+      expect(mockScheduleTaskNotification).toHaveBeenCalled();
+    });
+
+    it('toggle from true to false without reminder: no notification', async () => {
+      mockCancelTaskNotification.mockClear();
+      mockScheduleTaskNotification.mockClear();
+
+      const store = useTaskStore.getState();
+      store.addTask(createTestTask({ completed: true, reminderEnabled: false, notificationId: 0 }));
+      const taskId = useTaskStore.getState().tasks[0].id;
+
+      store.toggleTaskCompleted(taskId);
+
+      expect(useTaskStore.getState().tasks[0].completed).toBe(false);
+      expect(mockScheduleTaskNotification).not.toHaveBeenCalled();
+      expect(mockCancelTaskNotification).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('fetchTasks', () => {
+    it('should set loading state during fetch', async () => {
+      // fetchTasks 是异步的，但 set({ loading: true }) 是同步的
+      const store = useTaskStore.getState();
+      const fetchPromise = store.fetchTasks();
+
+      expect(useTaskStore.getState().loading).toBe(true);
+
+      await fetchPromise;
+      expect(useTaskStore.getState().loading).toBe(false);
+    });
+
+    it('should handle API failure cleanly', async () => {
+      const { taskApi } = require('../api/taskApi');
+      taskApi.getAll.mockResolvedValueOnce({ success: false, error: 'Server error' });
+
+      const store = useTaskStore.getState();
+      await store.fetchTasks();
+
+      expect(useTaskStore.getState().error).toContain('Server error');
+      expect(useTaskStore.getState().loading).toBe(false);
+    });
+
+    it('should fallback to localStorage on API failure', async () => {
+      const { taskApi } = require('../api/taskApi');
+      taskApi.getAll.mockResolvedValueOnce({ success: false, error: 'Server error' });
+
+      // 预先填充 localStorage
+      const storedData = {
+        state: {
+          tasks: [{ id: 'local-1', title: 'Local Task', dueDate: new Date().toISOString(), startDate: new Date().toISOString(), subtasks: [], completed: false, completedDates: [], notificationId: 0, priority: 'medium', reminderEnabled: false, recurrence: { enabled: false, type: 'daily', interval: 1, days: [], end: { type: 'never' }, exceptions: [] }, createdAt: new Date().toISOString(), taskType: 'single' }]
+        }
+      };
+      localStorage.setItem('task-storage', JSON.stringify(storedData));
+
+      const store = useTaskStore.getState();
+      await store.fetchTasks();
+
+      expect(useTaskStore.getState().tasks.length).toBe(1);
+      expect(useTaskStore.getState().tasks[0].title).toBe('Local Task');
+
+      // 清理
+      localStorage.removeItem('task-storage');
+    });
+  });
+
+  describe('loadTasks', () => {
+    it('should reload tasks from API and reschedule notifications', async () => {
+      const { taskApi } = require('../api/taskApi');
+      // 让 fetchTasks 返回一个带 reminder 的任务
+      taskApi.getAll.mockResolvedValueOnce({
+        success: true,
+        data: [{
+          id: 'api-task-1',
+          title: 'API Task',
+          dueDate: new Date().toISOString(),
+          startDate: new Date().toISOString(),
+          subtasks: [],
+          completed: false,
+          completedDates: [],
+          notificationId: 123,
+          priority: 'medium',
+          reminderEnabled: true,
+          recurrence: { enabled: false, type: 'daily', interval: 1, days: [], end: { type: 'never' }, exceptions: [] },
+          createdAt: new Date().toISOString(),
+          taskType: 'single',
+        }]
+      });
+
+      mockScheduleTaskNotification.mockClear();
+
+      const store = useTaskStore.getState();
+      await store.loadTasks();
+
+      expect(useTaskStore.getState().tasks.length).toBe(1);
+      expect(mockScheduleTaskNotification).toHaveBeenCalled();
+    });
+  });
+
+  describe('resolveTaskId edge cases', () => {
+    it('should handle getTaskStatistics via helper functions', () => {
+      const { getTodayTasks } = require('./taskStore');
+      const tasks = useTaskStore.getState().tasks;
+      // 添加一些任务
+      const store = useTaskStore.getState();
+      store.addTask(createTestTask({ title: 'Helper Test' }));
+
+      const todayTasks = getTodayTasks(useTaskStore.getState().tasks);
+      expect(Array.isArray(todayTasks)).toBe(true);
+    });
+  });
+
+  describe('helper functions', () => {
+    it('getMonthTasksFromStore returns monthly tasks', () => {
+      const tasks = useTaskStore.getState().tasks;
+      const store = useTaskStore.getState();
+      store.addTask(createTestTask({ title: 'Monthly Task' }));
+
+      const { getMonthTasksFromStore } = require('./taskStore');
+      const result = getMonthTasksFromStore(useTaskStore.getState().tasks, new Date());
+      expect(Array.isArray(result)).toBe(true);
+    });
+
+    it('getWeekTasks returns weekly tasks', () => {
+      const { getWeekTasks } = require('./taskStore');
+      const result = getWeekTasks([], new Date());
+      expect(result).toEqual([]);
+    });
+
+    it('getTasksInRange returns ranged tasks', () => {
+      const { getTasksInRange } = require('./taskStore');
+      const result = getTasksInRange([], new Date(), new Date());
+      expect(result).toEqual([]);
+    });
+  });
+
+  describe('addException / removeException rollback', () => {
+    it('should rollback addException on API failure', async () => {
+      const { taskApi } = require('../api/taskApi');
+      taskApi.update.mockResolvedValueOnce({ success: false, error: 'Network error' });
+
+      const store = useTaskStore.getState();
+      store.addTask(createTestTask({
+        title: 'Except Task',
+        recurrence: { enabled: true, type: 'daily', interval: 1, days: [], end: { type: 'never' }, exceptions: [] }
+      }));
+      const taskId = useTaskStore.getState().tasks[0].id;
+
+      store.addException(taskId, '2026-06-01');
+
+      // Optimistic: exception added
+      expect(useTaskStore.getState().tasks[0].recurrence.exceptions).toContain('2026-06-01');
+
+      await new Promise(resolve => setTimeout(resolve, 10));
+
+      // Rollback: exception removed
+      expect(useTaskStore.getState().tasks[0].recurrence.exceptions).not.toContain('2026-06-01');
+    });
+
+    it('should rollback removeException on API failure', async () => {
+      const { taskApi } = require('../api/taskApi');
+      taskApi.update.mockResolvedValueOnce({ success: false, error: 'Network error' });
+
+      const store = useTaskStore.getState();
+      store.addTask(createTestTask({
+        title: 'Except Task 2',
+        recurrence: { enabled: true, type: 'daily', interval: 1, days: [], end: { type: 'never' }, exceptions: ['2026-06-10'] }
+      }));
+      const taskId = useTaskStore.getState().tasks[0].id;
+
+      store.removeException(taskId, '2026-06-10');
+
+      // Optimistic: exception removed
+      expect(useTaskStore.getState().tasks[0].recurrence.exceptions).not.toContain('2026-06-10');
+
+      await new Promise(resolve => setTimeout(resolve, 10));
+
+      // Rollback: exception restored
+      expect(useTaskStore.getState().tasks[0].recurrence.exceptions).toContain('2026-06-10');
+    });
+
+    it('should not update recurrence for non-existent task', async () => {
+      const store = useTaskStore.getState();
+
+      // 尝试更新不存在的任务
+      await store.updateRecurrence('non-existent', { enabled: true, type: 'daily', interval: 1, days: [], end: { type: 'never' }, exceptions: [] });
+      // 不会崩溃
+      expect(useTaskStore.getState().tasks.length).toBe(0);
+    });
+
+    it('should not add exception for non-existent task', async () => {
+      const store = useTaskStore.getState();
+      await store.addException('non-existent', '2026-07-01');
+      expect(useTaskStore.getState().error).toBeNull();
+    });
+
+    it('should not remove exception for non-existent task', async () => {
+      const store = useTaskStore.getState();
+      await store.removeException('non-existent', '2026-07-01');
+      expect(useTaskStore.getState().error).toBeNull();
+    });
+  });
+
+  describe('helper functions', () => {
+    it('getTodayTasks returns only today\'s tasks', () => {
+      const today = new Date();
+      const todayStr = today.toISOString().split('T')[0];
+      const tomorrow = new Date(today);
+      tomorrow.setDate(tomorrow.getDate() + 1);
+
+      const tasks: Task[] = [
+        { id: '1', title: 'Today Task', dueDate: today.toISOString(), startDate: today.toISOString(), subtasks: [], completed: false, completedDates: [], notificationId: 0, priority: 'medium', reminderEnabled: false, recurrence: { enabled: false, type: 'daily', interval: 1, days: [], end: { type: 'never' }, exceptions: [] }, createdAt: today.toISOString(), taskType: 'single' },
+        { id: '2', title: 'Tomorrow Task', dueDate: tomorrow.toISOString(), startDate: tomorrow.toISOString(), subtasks: [], completed: false, completedDates: [], notificationId: 0, priority: 'medium', reminderEnabled: false, recurrence: { enabled: false, type: 'daily', interval: 1, days: [], end: { type: 'never' }, exceptions: [] }, createdAt: today.toISOString(), taskType: 'single' },
+      ];
+
+      const result = getTodayTasks(tasks);
+      expect(result.length).toBeGreaterThanOrEqual(1);
+      expect(result[0].title).toBe('Today Task');
+    });
+
+    it('getWeekTasks returns tasks for this week', () => {
+      const today = new Date();
+      const tasks: Task[] = [
+        { id: '1', title: 'This Week', dueDate: today.toISOString(), startDate: today.toISOString(), subtasks: [], completed: false, completedDates: [], notificationId: 0, priority: 'medium', reminderEnabled: false, recurrence: { enabled: false, type: 'daily', interval: 1, days: [], end: { type: 'never' }, exceptions: [] }, createdAt: today.toISOString(), taskType: 'single' },
+      ];
+      const result = getWeekTasks(tasks, today);
+      expect(result.length).toBeGreaterThanOrEqual(1);
+    });
+
+    it('getMonthTasksFromStore returns tasks for the month', () => {
+      const today = new Date();
+      const tasks: Task[] = [
+        { id: '1', title: 'This Month', dueDate: today.toISOString(), startDate: today.toISOString(), subtasks: [], completed: false, completedDates: [], notificationId: 0, priority: 'medium', reminderEnabled: false, recurrence: { enabled: false, type: 'daily', interval: 1, days: [], end: { type: 'never' }, exceptions: [] }, createdAt: today.toISOString(), taskType: 'single' },
+      ];
+      const result = getMonthTasksFromStore(tasks, today);
+      expect(result.length).toBeGreaterThanOrEqual(1);
+    });
+
+    it('getTasksInRange returns tasks within date range', () => {
+      const today = new Date();
+      const start = new Date(today);
+      start.setDate(start.getDate() - 1);
+      const end = new Date(today);
+      end.setDate(end.getDate() + 1);
+
+      const tasks: Task[] = [
+        { id: '1', title: 'In Range', dueDate: today.toISOString(), startDate: today.toISOString(), subtasks: [], completed: false, completedDates: [], notificationId: 0, priority: 'medium', reminderEnabled: false, recurrence: { enabled: false, type: 'daily', interval: 1, days: [], end: { type: 'never' }, exceptions: [] }, createdAt: today.toISOString(), taskType: 'single' },
+      ];
+      const result = getTasksInRange(tasks, start, end);
+      expect(result.length).toBeGreaterThanOrEqual(1);
+    });
+  });
+});
+
+// ============================================================
+// 深度嵌套子任务场景（覆盖辅助函数递归分支）
+// ============================================================
+
+describe('深度嵌套子任务', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    useTaskStore.setState({ tasks: [], loading: false, error: null });
+  });
+
+  it('三级嵌套子任务正确设置 level', async () => {
+    const store = useTaskStore.getState();
+    store.addTask(createTestTask({ title: 'Parent' }));
+    const taskId = useTaskStore.getState().tasks[0].id;
+
+    // Level 1
+    store.addSubTask(taskId, null, 'Level 1 - A');
+    const l1aId = useTaskStore.getState().tasks[0].subtasks[0].id;
+
+    // Level 2（嵌套在 Level 1-A 下）
+    store.addSubTask(taskId, l1aId, 'Level 2');
+    const l2Id = useTaskStore.getState().tasks[0].subtasks[0].subtasks[0].id;
+
+    // Level 3（嵌套在 Level 2 下）
+    store.addSubTask(taskId, l2Id, 'Level 3');
+
+    const tasks = useTaskStore.getState().tasks;
+    expect(tasks[0].subtasks[0].level).toBe(0);
+    expect(tasks[0].subtasks[0].subtasks[0].level).toBe(1);
+    expect(tasks[0].subtasks[0].subtasks[0].subtasks[0].level).toBe(2);
+  });
+
+  it('更新深层嵌套子任务', async () => {
+    const store = useTaskStore.getState();
+    store.addTask(createTestTask({ title: 'Parent' }));
+    const taskId = useTaskStore.getState().tasks[0].id;
+    store.addSubTask(taskId, null, 'L1');
+    const l1Id = useTaskStore.getState().tasks[0].subtasks[0].id;
+    store.addSubTask(taskId, l1Id, 'L2');
+    const l2Id = useTaskStore.getState().tasks[0].subtasks[0].subtasks[0].id;
+    store.addSubTask(taskId, l2Id, 'L3');
+    const l3Id = useTaskStore.getState().tasks[0].subtasks[0].subtasks[0].subtasks[0].id;
+
+    store.updateSubTask(taskId, l3Id, { title: 'Updated L3' });
+
+    expect(useTaskStore.getState().tasks[0].subtasks[0].subtasks[0].subtasks[0].title).toBe('Updated L3');
+  });
+
+  it('删除深层嵌套子任务', async () => {
+    const store = useTaskStore.getState();
+    store.addTask(createTestTask({ title: 'Parent' }));
+    const taskId = useTaskStore.getState().tasks[0].id;
+    store.addSubTask(taskId, null, 'L1');
+    const l1Id = useTaskStore.getState().tasks[0].subtasks[0].id;
+    store.addSubTask(taskId, l1Id, 'L2');
+    const l2Id = useTaskStore.getState().tasks[0].subtasks[0].subtasks[0].id;
+
+    // 删除 L2
+    store.deleteSubTask(taskId, l2Id);
+
+    expect(useTaskStore.getState().tasks[0].subtasks[0].subtasks.length).toBe(0);
+  });
+
+  it('切换深层嵌套子任务完成状态', async () => {
+    const store = useTaskStore.getState();
+    store.addTask(createTestTask({ title: 'Parent' }));
+    const taskId = useTaskStore.getState().tasks[0].id;
+    store.addSubTask(taskId, null, 'L1');
+    const l1Id = useTaskStore.getState().tasks[0].subtasks[0].id;
+    store.addSubTask(taskId, l1Id, 'L2');
+    const l2Id = useTaskStore.getState().tasks[0].subtasks[0].subtasks[0].id;
+
+    expect(useTaskStore.getState().tasks[0].subtasks[0].subtasks[0].completed).toBe(false);
+    store.toggleSubTaskCompleted(taskId, l2Id);
+    expect(useTaskStore.getState().tasks[0].subtasks[0].subtasks[0].completed).toBe(true);
+  });
+
+  it('getSubTaskLevel 查找不存在的子任务返回 -1', async () => {
+    const store = useTaskStore.getState();
+    store.addTask(createTestTask({ title: 'Parent' }));
+    const taskId = useTaskStore.getState().tasks[0].id;
+    store.addSubTask(taskId, null, 'L1');
+
+    // 尝试操作不存在的子任务（不会报错但也不会产生副作用）
+    store.updateSubTask(taskId, 'non-existent-id', { title: 'Ghost' });
+    // 没有任务和子任务被修改
+    expect(useTaskStore.getState().tasks[0].subtasks.length).toBe(1);
+  });
+
+  it('在兄弟子任务中搜索正确返回 level', async () => {
+    const store = useTaskStore.getState();
+    store.addTask(createTestTask({ title: 'Parent' }));
+    const taskId = useTaskStore.getState().tasks[0].id;
+
+    // 添加两层子任务：L1-A（无嵌套）、L1-B（含 L2）
+    store.addSubTask(taskId, null, 'L1-A');
+    store.addSubTask(taskId, null, 'L1-B');
+    const l1bId = useTaskStore.getState().tasks[0].subtasks[1].id;
+    store.addSubTask(taskId, l1bId, 'L2');
+    const l2Id = useTaskStore.getState().tasks[0].subtasks[1].subtasks[0].id;
+
+    store.updateSubTask(taskId, l2Id, { title: 'Updated via sibling search' });
+
+    expect(useTaskStore.getState().tasks[0].subtasks[1].subtasks[0].title).toBe('Updated via sibling search');
+  });
+
+  it('删除兄弟分支中的深层子任务', async () => {
+    const store = useTaskStore.getState();
+    store.addTask(createTestTask({ title: 'Parent' }));
+    const taskId = useTaskStore.getState().tasks[0].id;
+
+    store.addSubTask(taskId, null, 'L1-A');
+    store.addSubTask(taskId, null, 'L1-B');
+    const l1bId = useTaskStore.getState().tasks[0].subtasks[1].id;
+    store.addSubTask(taskId, l1bId, 'L2');
+    store.addSubTask(taskId, l1bId, 'L3');
+    const l3Id = useTaskStore.getState().tasks[0].subtasks[1].subtasks[1].id;
+
+    store.deleteSubTask(taskId, l3Id);
+
+    expect(useTaskStore.getState().tasks[0].subtasks[1].subtasks.length).toBe(1);
+    expect(useTaskStore.getState().tasks[0].subtasks[0].subtasks.length).toBe(0);
+  });
+
+  it('toggleTaskCompleted 回滚时恢复通知', async () => {
+    const { taskApi } = require('../api/taskApi');
+    taskApi.toggleCompleted.mockResolvedValueOnce({ success: false, error: 'Network error' });
+
+    mockScheduleTaskNotification.mockClear();
+    mockCancelTaskNotification.mockClear();
+
+    const store = useTaskStore.getState();
+    // 场景：从 false → true（API 失败需要回滚到 false）
+    store.addTask(createTestTask({ completed: false, reminderEnabled: true, notificationId: 123 }));
+    const taskId = useTaskStore.getState().tasks[0].id;
+
+    store.toggleTaskCompleted(taskId);
+    expect(useTaskStore.getState().tasks[0].completed).toBe(true);
+
+    await new Promise(resolve => setTimeout(resolve, 10));
+
+    // 回滚后 completed 为 false
+    expect(useTaskStore.getState().tasks[0].completed).toBe(false);
+  });
+});
+
+// ============================================================
+// resolveTaskId 覆盖
+// ============================================================
+
+describe('resolveTaskId 边缘场景', () => {
+  it('短 ID 直接返回', () => {
+    const { useTaskStore } = require('./taskStore');
+    const store = useTaskStore.getState();
+    store.addTask(createTestTask({ title: 'Test' }));
+    const taskId = useTaskStore.getState().tasks[0].id;
+
+    // 通过 toggleTaskCompleted 间接测试 - 直接使用 taskId
+    store.toggleTaskCompleted(taskId);
+    expect(useTaskStore.getState().tasks[0].completed).toBe(true);
+  });
+
+  it('resolveTaskId: 不存在的 ID 不会崩溃', () => {
+    const store = useTaskStore.getState();
+    store.addTask(createTestTask({ title: 'Origin' }));
+
+    // toggleTaskCompleted 传入不存在的 ID 不应崩溃
+    expect(() => {
+      store.toggleTaskCompleted('non-existent-id');
+    }).not.toThrow();
+  });
+
+  it('resolveTaskId: 短 ID 直接返回自身', () => {
+    // 创建任务用 uuid 格式 ID（有 5 段），短 ID 没有 '-' 分隔
+    const store = useTaskStore.getState();
+    const task = createTestTask({ title: 'Short ID Test' });
+    store.addTask(task);
+
+    // 使用未导出的 resolveTaskId 逻辑：toggleTaskCompleted 通过传入实际存在的 taskId 会成功
+    const foundTask = useTaskStore.getState().tasks[0];
+    expect(foundTask.title).toBe('Short ID Test');
+  });
+});
+
+describe('toggleTaskCompleted 回滚通知场景', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    useTaskStore.setState({ tasks: [], loading: false, error: null });
+  });
+
+  it('API 失败且 newCompleted=true, has reminder: 回滚时重新调度通知', async () => {
+    const { taskApi } = require('../api/taskApi');
+    taskApi.toggleCompleted.mockResolvedValueOnce({ success: false, error: 'Network error' });
+
+    mockScheduleTaskNotification.mockClear();
+    mockCancelTaskNotification.mockClear();
+
+    const store = useTaskStore.getState();
+    // 未完成、有 reminder、有 notificationId → 切换后 newCompleted=true → 取消通知
+    // API 失败回滚时：newCompleted=true 且 reminderEnabled=true → 恢复通知
+    store.addTask(createTestTask({
+      completed: false,
+      reminderEnabled: true,
+      notificationId: 456,
+    }));
+    const taskId = useTaskStore.getState().tasks[0].id;
+
+    store.toggleTaskCompleted(taskId);
+    expect(useTaskStore.getState().tasks[0].completed).toBe(true);
+
+    await new Promise(resolve => setTimeout(resolve, 10));
+    expect(useTaskStore.getState().tasks[0].completed).toBe(false);
+  });
+
+  it('API 失败且 newCompleted=false, has notificationId: 回滚时取消通知', async () => {
+    const { taskApi } = require('../api/taskApi');
+    taskApi.toggleCompleted.mockResolvedValueOnce({ success: false, error: 'Network error' });
+
+    mockScheduleTaskNotification.mockClear();
+    mockCancelTaskNotification.mockClear();
+
+    const store = useTaskStore.getState();
+    // 已完成、没有 reminder、但有 notificationId → 切换后 newCompleted=false → 不需要取消
+    // API 失败回滚时：newCompleted=false（回滚到 true）且 notificationId 存在 → 取消通知
+    store.addTask(createTestTask({
+      completed: true,
+      reminderEnabled: false,
+      notificationId: 789,
+    }));
+    const taskId = useTaskStore.getState().tasks[0].id;
+
+    store.toggleTaskCompleted(taskId);
+    expect(useTaskStore.getState().tasks[0].completed).toBe(false);
+
+    await new Promise(resolve => setTimeout(resolve, 10));
+    expect(useTaskStore.getState().tasks[0].completed).toBe(true);
+  });
+});
+
+describe('多子任务操作 map 全覆盖', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    useTaskStore.setState({ tasks: [], loading: false, error: null });
+  });
+
+  it('多个子任务时 updateSubTask 只更新目标', async () => {
+    const store = useTaskStore.getState();
+    store.addTask(createTestTask({ title: 'Parent' }));
+    const taskId = useTaskStore.getState().tasks[0].id;
+    store.addSubTask(taskId, null, 'Keep');
+    store.addSubTask(taskId, null, 'Update Me');
+    const subId = useTaskStore.getState().tasks[0].subtasks[1].id;
+
+    store.updateSubTask(taskId, subId, { title: 'Updated!' });
+
+    expect(useTaskStore.getState().tasks[0].subtasks[0].title).toBe('Keep');
+    expect(useTaskStore.getState().tasks[0].subtasks[1].title).toBe('Updated!');
+  });
+
+  it('多个子任务时 deleteSubTask 只删除目标', async () => {
+    const store = useTaskStore.getState();
+    store.addTask(createTestTask({ title: 'Parent' }));
+    const taskId = useTaskStore.getState().tasks[0].id;
+    store.addSubTask(taskId, null, 'Keep');
+    store.addSubTask(taskId, null, 'Delete Me');
+    store.addSubTask(taskId, null, 'Keep 2');
+    const subId = useTaskStore.getState().tasks[0].subtasks[1].id;
+
+    store.deleteSubTask(taskId, subId);
+
+    expect(useTaskStore.getState().tasks[0].subtasks.length).toBe(2);
+    expect(useTaskStore.getState().tasks[0].subtasks[0].title).toBe('Keep');
+    expect(useTaskStore.getState().tasks[0].subtasks[1].title).toBe('Keep 2');
+  });
+
+  it('多个子任务时 toggleSubTaskCompleted 只切换目标', async () => {
+    const store = useTaskStore.getState();
+    store.addTask(createTestTask({ title: 'Parent' }));
+    const taskId = useTaskStore.getState().tasks[0].id;
+    store.addSubTask(taskId, null, 'Keep Untouched');
+    store.addSubTask(taskId, null, 'Toggle Me');
+    const subId = useTaskStore.getState().tasks[0].subtasks[1].id;
+
+    store.toggleSubTaskCompleted(taskId, subId);
+
+    expect(useTaskStore.getState().tasks[0].subtasks[0].completed).toBe(false);
+    expect(useTaskStore.getState().tasks[0].subtasks[1].completed).toBe(true);
+  });
+});

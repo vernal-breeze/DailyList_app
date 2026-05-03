@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>日程管理应用</title>
+
+    <!-- PWA Meta Tags -->
+    <meta name="description" content="一个优雅的任务管理应用，帮助你更好地管理时间和任务" />
+    <meta name="theme-color" content="#ffb6b9" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="default" />
+    <meta name="apple-mobile-web-app-title" content="任务管理" />
+    <link rel="apple-touch-icon" href="/favicon.svg" />
+
+    <!-- Manifest -->
+    <link rel="manifest" href="/manifest.json" />
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+
+    <!-- Service Worker Registration -->
+    <script>
+      if ('serviceWorker' in navigator) {
+        window.addEventListener('load', () => {
+          navigator.serviceWorker.register('/service-worker.js').catch((err) => {
+            console.warn('Service Worker registration failed:', err);
+          });
+        });
+      }
+    </script>
+  </body>
+</html>
